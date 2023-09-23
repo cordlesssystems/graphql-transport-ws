@@ -38,7 +38,7 @@ type graphqlError struct {
 	Extensions map[string]interface{} `json:"extensions,omitempty"`
 }
 
-type genericPayload map[string]interface{}
+type GenericPayload map[string]interface{}
 
 var (
 	closeInitTimeout = websocket.FormatCloseMessage(4408, "Connection initialisation timeout")

@@ -13,34 +13,44 @@ import (
 )
 
 var (
+	defaultInitTimeout = time.Second * 5
+)
+
+var (
 	errInitTimeout = errors.New("initialisation timeout")
 )
 
 type (
-	executionResult json.RawMessage
+	ExecutionResult json.RawMessage
 )
 
 type (
-	handleInitFunc      = func(ctx context.Context, payload genericPayload) (context.Context, genericPayload, error)
-	handleSubscribeFunc = func(ctx context.Context, operationId string, payload json.RawMessage) (<-chan executionResult, <-chan error, error)
+	HandleInitFunc      = func(ctx context.Context, payload GenericPayload) (context.Context, GenericPayload, error)
+	HandleSubscribeFunc = func(ctx context.Context, operationId string, payload json.RawMessage) (<-chan ExecutionResult, <-chan error, error)
 )
 
 type Handler struct {
-	Upgrader                  websocket.Upgrader
+	upgrader                  *websocket.Upgrader
 	connectionInitWaitTimeout time.Duration
-	handleInit                handleInitFunc
-	handleSubscribe           handleSubscribeFunc
+	handleInit                HandleInitFunc
+	handleSubscribe           HandleSubscribeFunc
 }
 
-func NewHandler() *Handler {
-	return &Handler{}
+func NewHandler(handleInit HandleInitFunc, handleSubscribe HandleSubscribeFunc) *Handler {
+
+	return &Handler{
+		handleInit:                handleInit,
+		handleSubscribe:           handleSubscribe,
+		upgrader:                  &websocket.Upgrader{},
+		connectionInitWaitTimeout: defaultInitTimeout,
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	conn, err := h.Upgrader.Upgrade(w, r, http.Header{})
+	conn, err := h.upgrader.Upgrade(w, r, http.Header{})
 	if err != nil {
 		w.WriteHeader(400)
 		w.Write([]byte(`unable to upgrade`))
@@ -62,7 +72,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // connectionInit makes handshake
-func connectionInit(ctx context.Context, conn *websocket.Conn, timeout time.Duration, handleInit handleInitFunc) (context.Context, error) {
+func connectionInit(ctx context.Context, conn *websocket.Conn, timeout time.Duration, handleInit HandleInitFunc) (context.Context, error) {
 	var (
 		errCh = make(chan error)
 		msgCh = make(chan message)
@@ -112,7 +122,7 @@ func connectionInit(ctx context.Context, conn *websocket.Conn, timeout time.Dura
 
 }
 
-func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe handleSubscribeFunc) error {
+func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe HandleSubscribeFunc) error {
 	var (
 		reader   io.Reader
 		err      error
@@ -141,7 +151,7 @@ func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe handleSub
 		}
 
 		writeCh := make(chan message, 100)
-		go runWriter(conn, writeCh)
+		go runWriterLoop(conn, writeCh)
 
 		switch msg.Type {
 		case msgPing:
@@ -164,7 +174,7 @@ func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe handleSub
 
 			wg.Add(1)
 			go func() {
-				runSubscription(newCtx, msg.ID, msg.Payload, handleSubscribe, writeCh)
+				runSubscriptionLoop(newCtx, msg.ID, msg.Payload, handleSubscribe, writeCh)
 
 				wg.Done()
 				opMu.Lock()
@@ -178,7 +188,7 @@ func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe handleSub
 	}
 }
 
-func runWriter(conn *websocket.Conn, ch <-chan message) {
+func runWriterLoop(conn *websocket.Conn, ch <-chan message) {
 	var (
 		msg message
 		ok  bool
@@ -219,16 +229,16 @@ func runWriter(conn *websocket.Conn, ch <-chan message) {
 	}
 }
 
-func runSubscription(
+func runSubscriptionLoop(
 	ctx context.Context,
 	id string,
 	payload json.RawMessage,
-	handleSubscribe handleSubscribeFunc,
+	handleSubscribe HandleSubscribeFunc,
 	writeCh chan<- message,
 ) {
 
 	var (
-		exRes    executionResult
+		exRes    ExecutionResult
 		ok       bool
 		fatalErr = graphqlError{
 			Message: "error in handleSubscription",
