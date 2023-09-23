@@ -39,9 +39,11 @@ type Handler struct {
 func NewHandler(handleInit HandleInitFunc, handleSubscribe HandleSubscribeFunc) *Handler {
 
 	return &Handler{
-		handleInit:                handleInit,
-		handleSubscribe:           handleSubscribe,
-		upgrader:                  &websocket.Upgrader{},
+		handleInit:      handleInit,
+		handleSubscribe: handleSubscribe,
+		upgrader: &websocket.Upgrader{
+			Subprotocols: []string{"graphql-transport-ws"},
+		},
 		connectionInitWaitTimeout: defaultInitTimeout,
 	}
 }
@@ -94,15 +96,15 @@ func connectionInit(ctx context.Context, conn *websocket.Conn, timeout time.Dura
 		msgCh <- msg
 	}()
 
-	var (
-		msg message
-	)
+	//var (
+	//	msg message
+	//)
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
-	case msg = <-msgCh:
+	case <-msgCh:
 		break
 	case err = <-errCh:
 
@@ -294,7 +296,7 @@ func runSubscriptionLoop(
 				ID:      id,
 				Type:    msgNext,
 			}
-		case errCh, ok = <-errCh:
+		case err, ok = <-errCh:
 			if !ok {
 				// subscription ended
 				return

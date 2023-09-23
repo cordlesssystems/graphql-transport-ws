@@ -7,6 +7,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cordlesssystems/graphql-transport-ws/contrib/gqlgen/example/graph/model"
 )
@@ -23,7 +24,24 @@ func (r *queryResolver) Todos(ctx context.Context) ([]*model.Todo, error) {
 
 // CurrentTime is the resolver for the currentTime field.
 func (r *subscriptionResolver) CurrentTime(ctx context.Context) (<-chan string, error) {
-	panic(fmt.Errorf("not implemented: CurrentTime - currentTime"))
+
+	ch := make(chan string)
+	go func() {
+		defer close(ch)
+
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+
+		for {
+			select {
+			case <-t.C:
+				ch <- time.Now().String()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, nil
 }
 
 // Mutation returns MutationResolver implementation.

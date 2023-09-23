@@ -24,7 +24,7 @@ func (t *Transport) Do(w http.ResponseWriter, r *http.Request, exec graphql.Grap
 		return ctx, graphql_transport_ws.InitAckPayload{}, nil
 	}
 
-	if t.handleInit != nil {
+	if t.handleInit == nil {
 		t.handleInit = handleInit
 	}
 
