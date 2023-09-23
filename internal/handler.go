@@ -179,7 +179,44 @@ func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe handleSub
 }
 
 func runWriter(conn *websocket.Conn, ch <-chan message) {
+	var (
+		msg message
+		ok  bool
+		w   io.WriteCloser
+		err error
+		b   []byte
+	)
 
+	for {
+		msg, ok = <-ch
+		if !ok {
+			return
+		}
+
+		w, err = conn.NextWriter(websocket.TextMessage)
+		if errors.Is(err, websocket.ErrCloseSent) {
+			continue
+		}
+		if err != nil {
+			panic(err)
+		}
+
+		b, err = json.Marshal(msg)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = w.Write(b)
+		if err != nil {
+			panic(err)
+		}
+
+		err = w.Close()
+		if err != nil {
+			panic(err)
+		}
+
+	}
 }
 
 func runSubscription(
