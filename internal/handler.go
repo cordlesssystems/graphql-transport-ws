@@ -118,6 +118,26 @@ func connectionInit(ctx context.Context, conn *websocket.Conn, timeout time.Dura
 		return ctx, errInitTimeout
 	}
 
+	ctx, ackPayload, err := handleInit(ctx, GenericPayload{})
+
+	b, err := json.Marshal(ackPayload)
+	if err != nil {
+		return ctx, err
+	}
+
+	payload, err := json.Marshal(message{
+		Payload: b,
+		Type:    msgConnectionAck,
+	})
+	if err != nil {
+		return ctx, err
+	}
+
+	err = conn.WriteMessage(websocket.TextMessage, payload)
+	if err != nil {
+		return ctx, err
+	}
+
 	return ctx, nil
 
 }
