@@ -13,11 +13,10 @@ import (
 )
 
 var (
-	defaultInitTimeout = time.Second * 5
-)
-
-var (
-	errInitTimeout = errors.New("initialisation timeout")
+	defaultInitTimeout    = time.Second * 5
+	defaultControlTimeout = func() time.Time {
+		return time.Now().Add(time.Second * 5)
+	}
 )
 
 type (
@@ -25,7 +24,7 @@ type (
 )
 
 type (
-	HandleInitFunc      = func(ctx context.Context, payload GenericPayload) (context.Context, GenericPayload, error)
+	HandleInitFunc      = func(ctx context.Context, payload GenericPayload) (context.Context, json.RawMessage, error)
 	HandleSubscribeFunc = func(ctx context.Context, operationId string, payload json.RawMessage) (<-chan ExecutionResult, <-chan error, error)
 )
 
@@ -36,171 +35,168 @@ type Handler struct {
 	handleSubscribe           HandleSubscribeFunc
 }
 
-func NewHandler(handleInit HandleInitFunc, handleSubscribe HandleSubscribeFunc) *Handler {
+type WebsocketCloser interface {
+	Code() int
+	Reason() string
+}
 
-	return &Handler{
-		handleInit:      handleInit,
+func WithHandleInit(handleInit HandleInitFunc) func(*Handler) {
+	return func(h *Handler) {
+		h.handleInit = handleInit
+	}
+}
+
+func NewHandler(handleSubscribe HandleSubscribeFunc, opts ...func(*Handler)) (*Handler, error) {
+
+	if handleSubscribe == nil {
+		return nil, errors.New("handleSubscribe is nil")
+	}
+
+	h := &Handler{
+		handleInit:      handleInitDefault,
 		handleSubscribe: handleSubscribe,
 		upgrader: &websocket.Upgrader{
 			Subprotocols: []string{"graphql-transport-ws"},
 		},
 		connectionInitWaitTimeout: defaultInitTimeout,
 	}
+
+	for _, opt := range opts {
+		opt(h)
+	}
+
+	return h, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
-	ctx := r.Context()
-
+	// Upgrade connection
 	conn, err := h.upgrader.Upgrade(w, r, http.Header{})
 	if err != nil {
-		w.WriteHeader(400)
-		w.Write([]byte(`unable to upgrade`))
-		return
+		panic(err)
 	}
-	defer conn.Close()
-
-	var newCtx context.Context
-	newCtx, err = connectionInit(ctx, conn, h.connectionInitWaitTimeout, h.handleInit)
-	if err != nil {
-		return
-	}
-
-	err = listen(newCtx, conn, h.handleSubscribe)
-	if err != nil {
-		return
-	}
-
-}
-
-// connectionInit makes handshake
-func connectionInit(ctx context.Context, conn *websocket.Conn, timeout time.Duration, handleInit HandleInitFunc) (context.Context, error) {
-	var (
-		errCh = make(chan error)
-		msgCh = make(chan message)
-		err   error
-	)
-
-	go func() {
-		defer close(errCh)
-		defer close(msgCh)
-
-		var (
-			msg message
-		)
-		err = conn.ReadJSON(&msg)
+	defer func() {
+		err = conn.Close()
 		if err != nil {
-			errCh <- err
-			return
+			panic(err)
 		}
-		msgCh <- msg
 	}()
 
-	//var (
-	//	msg message
-	//)
+	// Run initialisation
+	ctx := context.Background()
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	select {
-	case <-msgCh:
-		break
-	case err = <-errCh:
-
-	case <-timer.C:
-		err = conn.WriteMessage(websocket.CloseMessage, closeInitTimeout)
-		if err != nil {
-			return ctx, fmt.Errorf(
-				"unable to write CloseMessage control frame after initialisation timeout: %w: %w",
-				errInitTimeout,
-				err,
-			)
-		}
-		return ctx, errInitTimeout
-	}
-
-	ctx, ackPayload, err := handleInit(ctx, GenericPayload{})
-
-	b, err := json.Marshal(ackPayload)
-	if err != nil {
-		return ctx, err
-	}
-
-	payload, err := json.Marshal(message{
-		Payload: b,
-		Type:    msgConnectionAck,
-	})
-	if err != nil {
-		return ctx, err
-	}
-
-	err = conn.WriteMessage(websocket.TextMessage, payload)
-	if err != nil {
-		return ctx, err
-	}
-
-	return ctx, nil
-
+	messagesCh := make(chan message, 100)
+	defer close(messagesCh)
+	go func() {
+		_ = runWriterLoop(conn, messagesCh)
+	}()
+	_ = runReaderLoop(ctx, conn, messagesCh, h.handleInit, h.handleSubscribe, h.connectionInitWaitTimeout) // blocking call
 }
 
-func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe HandleSubscribeFunc) error {
+func runReaderLoop(
+	ctx context.Context,
+	conn *websocket.Conn,
+	ch chan<- message,
+	handleInit HandleInitFunc,
+	handleSubscribe HandleSubscribeFunc,
+	initTimeout time.Duration,
+) error {
+
 	var (
-		reader   io.Reader
-		err      error
-		closeErr *websocket.CloseError
-		msg      message
-		opMu     sync.Mutex
-		op       = make(map[string]func())
-		cancel   func()
-		ok       bool
-		newCtx   context.Context
+		reader                                  io.Reader
+		err                                     error
+		closeErr                                *websocket.CloseError
+		msg                                     message
+		opMu                                    sync.Mutex
+		subscriptions                           = make(map[string]func())
+		cancel                                  func()
+		ok                                      bool
+		initialised                             AtomicBool
+		initialisedContext, subscriptionContext context.Context
+		ackPayload                              json.RawMessage
 	)
 
+	timer := time.NewTimer(initTimeout)
+	defer timer.Stop()
+	go func() {
+		<-timer.C
+		if !initialised.Value() {
+			err = conn.WriteControl(websocket.CloseMessage, closeInitTimeout, defaultControlTimeout())
+			if err != nil {
+				panic(err)
+			}
+		}
+	}()
+
 	var wg sync.WaitGroup
+	defer func() {
+		opMu.Lock()
+		for _, cancel = range subscriptions {
+			cancel()
+		}
+		opMu.Unlock()
+		wg.Wait() // wait until all subscriptions are finished
+	}()
 	for {
 		_, reader, err = conn.NextReader()
 		if errors.As(err, &closeErr) {
 			return nil
 		}
 		if err != nil {
-			return err
+			return fmt.Errorf("unexpected error in .NextReader(): %v", err)
 		}
 
 		err = json.NewDecoder(reader).Decode(&msg)
 		if err != nil {
-			// write close message with relevant code
+			err = conn.WriteControl(websocket.CloseMessage, closeMessageParsing, defaultControlTimeout())
+			if err != nil {
+				return fmt.Errorf("unable to write CloseMessage control %s: %v", closeMessageParsing, err)
+			}
+			continue
 		}
 
-		writeCh := make(chan message, 100)
-		go runWriterLoop(conn, writeCh)
-
 		switch msg.Type {
+		case msgConnectionInit:
+			initialisedContext, ackPayload, err = initialise(ctx, initialised, conn, reader, handleInit)
+			if err != nil {
+				return err
+			}
+			initialised.Set(true)
+			ch <- message{
+				Payload: ackPayload,
+				Type:    msgConnectionAck,
+			}
+
 		case msgPing:
 			// implement me
 		case msgPong:
-			// implement me
+			// not supported yet
 		case msgComplete:
 			opMu.Lock()
-			cancel, ok = op[msg.ID]
+			cancel, ok = subscriptions[msg.ID]
 			if ok {
 				cancel()
 			}
 			opMu.Unlock()
 		case msgSubscribe:
+			if !initialised.Value() {
+				// send error
+				// but not close socket
+			}
 
-			newCtx, cancel = context.WithCancel(ctx)
+			// subscriptionContext will be canceled on "complete" message
+			// for this subscription
+			subscriptionContext, cancel = context.WithCancel(initialisedContext)
 			opMu.Lock()
-			op[msg.ID] = cancel
+			subscriptions[msg.ID] = cancel
 			opMu.Unlock()
 
 			wg.Add(1)
 			go func() {
-				runSubscriptionLoop(newCtx, msg.ID, msg.Payload, handleSubscribe, writeCh)
-
+				runSubscriptionLoop(subscriptionContext, msg.ID, msg.Payload, handleSubscribe, ch)
 				wg.Done()
 				opMu.Lock()
-				delete(op, msg.ID)
+				delete(subscriptions, msg.ID)
 				opMu.Unlock()
 			}()
 		default:
@@ -210,7 +206,7 @@ func listen(ctx context.Context, conn *websocket.Conn, handleSubscribe HandleSub
 	}
 }
 
-func runWriterLoop(conn *websocket.Conn, ch <-chan message) {
+func runWriterLoop(conn *websocket.Conn, ch <-chan message) error {
 	var (
 		msg message
 		ok  bool
@@ -222,30 +218,30 @@ func runWriterLoop(conn *websocket.Conn, ch <-chan message) {
 	for {
 		msg, ok = <-ch
 		if !ok {
-			return
+			return nil
 		}
 
 		w, err = conn.NextWriter(websocket.TextMessage)
 		if errors.Is(err, websocket.ErrCloseSent) {
-			continue
+			return nil
 		}
 		if err != nil {
-			panic(err)
+			return err
 		}
 
 		b, err = json.Marshal(msg)
 		if err != nil {
-			panic(err)
+			return err
 		}
 
 		_, err = w.Write(b)
 		if err != nil {
-			panic(err)
+			return err
 		}
 
 		err = w.Close()
 		if err != nil {
-			panic(err)
+			return err
 		}
 
 	}
@@ -316,4 +312,66 @@ func runSubscriptionLoop(
 			return
 		}
 	}
+}
+
+func initialise(
+	ctx context.Context,
+	initialised AtomicBool,
+	conn *websocket.Conn,
+	reader io.Reader,
+	handleInit HandleInitFunc,
+) (context.Context, json.RawMessage, error) {
+
+	var (
+		msg                message
+		initPayload        GenericPayload
+		initialisedContext context.Context
+		ackPayload         json.RawMessage
+		err                error
+	)
+
+	if initialised.Value() {
+		err = conn.WriteControl(websocket.CloseMessage, closeTooManyInit, defaultControlTimeout())
+		if err != nil {
+			return ctx, nil, fmt.Errorf("unable to write CloseMessage control %s: %v", closeTooManyInit, err)
+		}
+		return ctx, nil, errors.New("already initialised")
+	}
+	err = json.NewDecoder(reader).Decode(&msg)
+	if err != nil {
+		err = conn.WriteControl(websocket.CloseMessage, closeMessageParsing, defaultControlTimeout())
+		if err != nil {
+			return ctx, nil, fmt.Errorf("unable to write CloseMessage control %s: %v", closeMessageParsing, err)
+		}
+		return ctx, nil, errors.New("unable parse message")
+	}
+	err = json.Unmarshal(msg.Payload, &initPayload)
+	if err != nil {
+		err = conn.WriteControl(websocket.CloseMessage, closeMessageParsing, defaultControlTimeout())
+		if err != nil {
+			return ctx, nil, fmt.Errorf("unable to write CloseMessage control %s: %v", closeMessageParsing, err)
+		}
+		return ctx, nil, errors.New("unable parse init payload")
+	}
+	initialisedContext, ackPayload, err = handleInit(ctx, initPayload)
+	if err != nil {
+		var closeMsg []byte
+		if e, ok := err.(WebsocketCloser); ok { // init handler might provide custom close message
+			closeMsg = websocket.FormatCloseMessage(e.Code(), e.Reason())
+		} else {
+			closeMsg = closeForbidden
+		}
+
+		err = conn.WriteControl(websocket.CloseMessage, closeMsg, defaultControlTimeout())
+		if err != nil {
+			return ctx, nil, fmt.Errorf("unable to write CloseMessage control after init function %s: %v", closeMsg, err)
+		}
+		return ctx, nil, errors.New("initFunc returned error")
+	}
+
+	return initialisedContext, ackPayload, nil
+}
+
+func handleInitDefault(ctx context.Context, payload GenericPayload) (context.Context, json.RawMessage, error) {
+	return ctx, nil, nil
 }

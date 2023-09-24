@@ -35,7 +35,7 @@ func (r *subscriptionResolver) CurrentTime(ctx context.Context) (<-chan string, 
 		for {
 			select {
 			case <-t.C:
-				ch <- time.Now().String()
+				ch <- time.Now().Format(time.TimeOnly)
 			case <-ctx.Done():
 				return
 			}

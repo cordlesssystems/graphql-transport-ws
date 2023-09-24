@@ -41,5 +41,9 @@ type graphqlError struct {
 type GenericPayload map[string]interface{}
 
 var (
-	closeInitTimeout = websocket.FormatCloseMessage(4408, "Connection initialisation timeout")
+	closeInitTimeout        = websocket.FormatCloseMessage(4408, "Connection initialisation timeout")
+	closeMessageParsing     = websocket.FormatCloseMessage(4400, "Message parsing error")
+	closeForbidden          = websocket.FormatCloseMessage(4403, "Forbidden")
+	closeUnknownMessageType = websocket.FormatCloseMessage(4400, "Unknown message type")
+	closeTooManyInit        = websocket.FormatCloseMessage(4429, "Too many initialisation requests")
 )
