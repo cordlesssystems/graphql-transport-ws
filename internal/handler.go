@@ -13,9 +13,13 @@ import (
 )
 
 var (
-	defaultInitTimeout    = time.Second * 5
-	defaultControlTimeout = func() time.Time {
+	defaultInitTimeout             = time.Second * 5
+	defaultWriterChannelBufferSize = 100
+	defaultControlTimeout          = func() time.Time {
 		return time.Now().Add(time.Second * 5)
+	}
+	defaultHandleInit = func(ctx context.Context, payload GenericPayload) (context.Context, json.RawMessage, error) {
+		return ctx, nil, nil
 	}
 )
 
@@ -29,21 +33,18 @@ type (
 )
 
 type Handler struct {
-	upgrader                  *websocket.Upgrader
-	connectionInitWaitTimeout time.Duration
-	handleInit                HandleInitFunc
-	handleSubscribe           HandleSubscribeFunc
+	upgrader                     *websocket.Upgrader
+	connectionInitWaitTimeout    time.Duration
+	handleInit                   HandleInitFunc
+	handleSubscribe              HandleSubscribeFunc
+	subscribeBeforeInitCloseCode []byte
+	writerChannelBufferSize      int
+	debugHandler                 bool
 }
 
 type WebsocketCloser interface {
 	Code() int
 	Reason() string
-}
-
-func WithHandleInit(handleInit HandleInitFunc) func(*Handler) {
-	return func(h *Handler) {
-		h.handleInit = handleInit
-	}
 }
 
 func NewHandler(handleSubscribe HandleSubscribeFunc, opts ...func(*Handler)) (*Handler, error) {
@@ -53,12 +54,14 @@ func NewHandler(handleSubscribe HandleSubscribeFunc, opts ...func(*Handler)) (*H
 	}
 
 	h := &Handler{
-		handleInit:      handleInitDefault,
+		handleInit:      defaultHandleInit,
 		handleSubscribe: handleSubscribe,
 		upgrader: &websocket.Upgrader{
 			Subprotocols: []string{"graphql-transport-ws"},
 		},
-		connectionInitWaitTimeout: defaultInitTimeout,
+		connectionInitWaitTimeout:    defaultInitTimeout,
+		subscribeBeforeInitCloseCode: closeForbidden,
+		writerChannelBufferSize:      defaultWriterChannelBufferSize,
 	}
 
 	for _, opt := range opts {
@@ -88,18 +91,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	messagesCh := make(chan message, 100)
 	defer close(messagesCh)
 	go func() {
-		_ = runWriterLoop(conn, messagesCh)
+		_ = writeLoop(conn, messagesCh)
 	}()
-	_ = runReaderLoop(ctx, conn, messagesCh, h.handleInit, h.handleSubscribe, h.connectionInitWaitTimeout) // blocking call
+	_ = h.readLoop(ctx, conn, messagesCh) // blocking call
 }
 
-func runReaderLoop(
+func (h *Handler) readLoop(
 	ctx context.Context,
 	conn *websocket.Conn,
 	ch chan<- message,
-	handleInit HandleInitFunc,
-	handleSubscribe HandleSubscribeFunc,
-	initTimeout time.Duration,
 ) error {
 
 	var (
@@ -109,6 +109,7 @@ func runReaderLoop(
 		msg                                     message
 		opMu                                    sync.Mutex
 		subscriptions                           = make(map[string]func())
+		subscriptionsClientSentComplete         = make(map[string]struct{})
 		cancel                                  func()
 		ok                                      bool
 		initialised                             AtomicBool
@@ -116,7 +117,7 @@ func runReaderLoop(
 		ackPayload                              json.RawMessage
 	)
 
-	timer := time.NewTimer(initTimeout)
+	timer := time.NewTimer(h.connectionInitWaitTimeout)
 	defer timer.Stop()
 	go func() {
 		<-timer.C
@@ -130,8 +131,10 @@ func runReaderLoop(
 
 	var wg sync.WaitGroup
 	defer func() {
+		//var msgId string
 		opMu.Lock()
 		for _, cancel = range subscriptions {
+			//subscriptionsClientSentComplete[msgId] = struct{}{}
 			cancel()
 		}
 		opMu.Unlock()
@@ -157,13 +160,13 @@ func runReaderLoop(
 
 		switch msg.Type {
 		case msgConnectionInit:
-			initialisedContext, ackPayload, err = initialise(ctx, initialised, conn, reader, handleInit)
+			initialisedContext, ackPayload, err = h.initialise(ctx, initialised, msg, conn)
 			if err != nil {
 				return err
 			}
 			initialised.Set(true)
 			ch <- message{
-				Payload: ackPayload,
+				Payload: &ackPayload,
 				Type:    msgConnectionAck,
 			}
 
@@ -175,13 +178,17 @@ func runReaderLoop(
 			opMu.Lock()
 			cancel, ok = subscriptions[msg.ID]
 			if ok {
+				subscriptionsClientSentComplete[msg.ID] = struct{}{}
 				cancel()
 			}
 			opMu.Unlock()
 		case msgSubscribe:
 			if !initialised.Value() {
-				// send error
-				// but not close socket
+				err = conn.WriteControl(websocket.CloseMessage, h.subscribeBeforeInitCloseCode, defaultControlTimeout())
+				if err != nil {
+					return fmt.Errorf("unable to write CloseMessage control %s: %v", h.subscribeBeforeInitCloseCode, err)
+				}
+				continue
 			}
 
 			// subscriptionContext will be canceled on "complete" message
@@ -193,20 +200,36 @@ func runReaderLoop(
 
 			wg.Add(1)
 			go func() {
-				runSubscriptionLoop(subscriptionContext, msg.ID, msg.Payload, handleSubscribe, ch)
+				msgId := msg.ID
+				var clientCompleted bool
+				err = subscribeLoop(subscriptionContext, msgId, *msg.Payload, h.handleSubscribe, ch)
 				wg.Done()
 				opMu.Lock()
-				delete(subscriptions, msg.ID)
+				_, clientCompleted = subscriptionsClientSentComplete[msgId]
+				delete(subscriptions, msgId)
+				delete(subscriptionsClientSentComplete, msgId)
 				opMu.Unlock()
+
+				if !clientCompleted && err == nil {
+					// subscription completed because server sent all events
+					ch <- message{
+						ID:   msgId,
+						Type: msgComplete,
+					}
+				}
 			}()
 		default:
-			// write close message with relevant code
+			err = conn.WriteControl(websocket.CloseMessage, closeUnknownMessageType, defaultControlTimeout())
+			if err != nil {
+				return fmt.Errorf("unable to write CloseMessage control %s: %v", h.subscribeBeforeInitCloseCode, err)
+			}
+			continue
 		}
 
 	}
 }
 
-func runWriterLoop(conn *websocket.Conn, ch <-chan message) error {
+func writeLoop(conn *websocket.Conn, ch <-chan message) error {
 	var (
 		msg message
 		ok  bool
@@ -247,37 +270,40 @@ func runWriterLoop(conn *websocket.Conn, ch <-chan message) error {
 	}
 }
 
-func runSubscriptionLoop(
+func subscribeLoop(
 	ctx context.Context,
 	id string,
 	payload json.RawMessage,
 	handleSubscribe HandleSubscribeFunc,
 	writeCh chan<- message,
-) {
+) error {
 
 	var (
 		exRes    ExecutionResult
+		exResRaw json.RawMessage
 		ok       bool
 		fatalErr = graphqlError{
 			Message: "error in handleSubscription",
 		}
+		serErr error
+		b      json.RawMessage
 	)
 
 	execResultCh, errCh, err := handleSubscribe(ctx, id, payload)
 
 	if err != nil {
 
-		b, serErr := json.Marshal(fatalErr)
+		b, serErr = json.Marshal(fatalErr)
 		if serErr != nil {
 			panic(serErr)
 		}
 
 		writeCh <- message{
-			Payload: b,
+			Payload: &b,
 			ID:      id,
 			Type:    msgError,
 		}
-		return
+		return err
 	}
 
 	for {
@@ -285,45 +311,44 @@ func runSubscriptionLoop(
 		case exRes, ok = <-execResultCh:
 			if !ok {
 				// subscription ended
-				return
+				return nil
 			}
+			exResRaw = json.RawMessage(exRes)
 			writeCh <- message{
-				Payload: json.RawMessage(exRes),
+				Payload: &exResRaw,
 				ID:      id,
 				Type:    msgNext,
 			}
 		case err, ok = <-errCh:
 			if !ok {
 				// subscription ended
-				return
+				return nil
 			}
 			gqlErr := graphqlError{
 				Message: "error in handleSubscription",
 			}
-			b, serErr := json.Marshal(gqlErr)
+			b, serErr = json.Marshal(gqlErr)
 			if serErr != nil {
 				panic(serErr)
 			}
 			writeCh <- message{
-				Payload: b,
+				Payload: &b,
 				ID:      id,
 				Type:    msgError,
 			}
-			return
+			return err
 		}
 	}
 }
 
-func initialise(
+func (h *Handler) initialise(
 	ctx context.Context,
 	initialised AtomicBool,
+	msg message,
 	conn *websocket.Conn,
-	reader io.Reader,
-	handleInit HandleInitFunc,
 ) (context.Context, json.RawMessage, error) {
 
 	var (
-		msg                message
 		initPayload        GenericPayload
 		initialisedContext context.Context
 		ackPayload         json.RawMessage
@@ -337,23 +362,18 @@ func initialise(
 		}
 		return ctx, nil, errors.New("already initialised")
 	}
-	err = json.NewDecoder(reader).Decode(&msg)
-	if err != nil {
-		err = conn.WriteControl(websocket.CloseMessage, closeMessageParsing, defaultControlTimeout())
-		if err != nil {
-			return ctx, nil, fmt.Errorf("unable to write CloseMessage control %s: %v", closeMessageParsing, err)
-		}
-		return ctx, nil, errors.New("unable parse message")
+	if msg.Payload != nil {
+		err = json.Unmarshal(*msg.Payload, &initPayload)
 	}
-	err = json.Unmarshal(msg.Payload, &initPayload)
 	if err != nil {
+		h.log("unable to unmarshall connection_init message", err)
 		err = conn.WriteControl(websocket.CloseMessage, closeMessageParsing, defaultControlTimeout())
 		if err != nil {
 			return ctx, nil, fmt.Errorf("unable to write CloseMessage control %s: %v", closeMessageParsing, err)
 		}
 		return ctx, nil, errors.New("unable parse init payload")
 	}
-	initialisedContext, ackPayload, err = handleInit(ctx, initPayload)
+	initialisedContext, ackPayload, err = h.handleInit(ctx, initPayload)
 	if err != nil {
 		var closeMsg []byte
 		if e, ok := err.(WebsocketCloser); ok { // init handler might provide custom close message
@@ -372,6 +392,8 @@ func initialise(
 	return initialisedContext, ackPayload, nil
 }
 
-func handleInitDefault(ctx context.Context, payload GenericPayload) (context.Context, json.RawMessage, error) {
-	return ctx, nil, nil
+func (h *Handler) log(args ...interface{}) {
+	if h.debugHandler {
+		fmt.Println(args...)
+	}
 }

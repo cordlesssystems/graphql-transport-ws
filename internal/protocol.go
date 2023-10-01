@@ -21,9 +21,9 @@ const (
 )
 
 type message struct {
-	Payload json.RawMessage `json:"payload,omitempty"`
-	ID      string          `json:"id,omitempty"`
-	Type    messageType     `json:"type"`
+	Payload *json.RawMessage `json:"payload,omitempty"`
+	ID      string           `json:"id,omitempty"`
+	Type    messageType      `json:"type"`
 }
 
 type location struct {
